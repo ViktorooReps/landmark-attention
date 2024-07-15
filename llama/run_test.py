@@ -23,7 +23,7 @@ import requests
 llama_weights_7b_base = "/llama_weights/7B_hf/"
 llama_weights_7b_tuned = "/llama-redpajama-mem-15000-with-mem/"
 cache_path = "/hf-cache/"
-use_flash = False # using flash for inference is only implemented for when offloading kv to cpu
+use_flash = False  # using flash for inference is only implemented for when offloading kv to cpu
 top_k = 5
 dtype = torch.bfloat16
 
