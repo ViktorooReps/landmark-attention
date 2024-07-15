@@ -1,3 +1,6 @@
 [submodule "RULER"]
 	path = RULER
 	url = https://github.com/ViktorooReps/RULER
+[submodule "original_llama"]
+	path = original_llama
+	url = https://github.com/ViktorooReps/llama.git
