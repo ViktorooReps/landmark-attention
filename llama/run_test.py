@@ -18,12 +18,16 @@ import os
 import random
 import re
 import requests
+import logging
+
+import json
 
 
-llama_weights_7b_base = "/llama_weights/7B_hf/"
-llama_weights_7b_tuned = "/llama-redpajama-mem-15000-with-mem/"
-cache_path = "/hf-cache/"
-use_flash = False  # using flash for inference is only implemented for when offloading kv to cpu
+llama_weights_7b_base = "huggyllama/llama-7b"
+llama_weights_7b_tuned = "/mloscratch/homes/mohtasha/llm/llama-redpajama-mem-8000-with-mem-triton-new-format"
+cache_path = "/mloscratch/hf_cache/"
+use_flash = True
+offload_cache_to_cpu = False
 top_k = 5
 dtype = torch.bfloat16
 
@@ -38,7 +42,7 @@ def make_llama_base_pipe():
         cache_dir=cache_path,
     )
 
-    llama_base = llama_base.to('cuda:0')
+    llama_base = llama_base.to('cuda:1')
 
     import transformers
     
@@ -55,7 +59,7 @@ def make_llama_base_pipe():
 
 
 
-llama_base_pipe = make_llama_base_pipe()
+# llama_base_pipe = make_llama_base_pipe()
 
 def make_llama_mem_pipe():
     from llama_mem import LlamaForCausalLM
@@ -66,14 +70,14 @@ def make_llama_mem_pipe():
         torch_dtype=dtype
     )
 
-    model.to('cuda:1')
+    model.to('cuda')
 
     import transformers
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
             llama_weights_7b_tuned,
             cache_dir=cache_path,
-            model_max_length=model.config.train_context_length,
+            model_max_length=None,
             padding_side="right",
             use_fast=False,
         )
@@ -81,8 +85,8 @@ def make_llama_mem_pipe():
     model.set_mem_id(mem_id)
     from transformers import pipeline
     llama_mem_pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, device=model.device,
-                              offload_cache_to_cpu=use_flash, use_flash=use_flash, 
-                              cache_top_k=top_k)
+                              offload_cache_to_cpu=offload_cache_to_cpu, use_flash=use_flash, 
+                              cache_top_k=top_k, device_map="auto", torch_dtype=torch.bfloat16)
     return llama_mem_pipe
 
 
@@ -90,7 +94,7 @@ llama_mem_pipe = make_llama_mem_pipe()
 
 
 
-pipes = {"base": llama_base_pipe, "mem": llama_mem_pipe}
+pipes = {"mem": llama_mem_pipe}  # {"base": llama_base_pipe, "mem": llama_mem_pipe}
 
 
 def generate_prompt(n_garbage):
@@ -104,8 +108,8 @@ def generate_prompt(n_garbage):
     assert len(garbage_inf) >= n_garbage
     garbage_prefix = garbage_inf[:n_garbage_prefix]
     garbage_suffix = garbage_inf[:n_garbage_suffix]
-    pass_key = random.randint(1, 50000)
-    information_line = f"The pass key is {pass_key}. Remember it. {pass_key} is the pass key."
+    pass_key = random.randint(100_000, 10_0000_000)
+    information_line = f"The pass key is {pass_key}. " # f"The pass key is {pass_key}. Remember it. {pass_key} is the pass key."
     final_question = "What is the pass key? The pass key is"
     lines = [
         task_description,
@@ -130,11 +134,13 @@ def test_model(prompt_text, pass_key, model_name):
     return pass_key
 
 
-n_values = [0, 100, 500, 1000, 5000, 8000, 10000, 12000, 14000, 18000, 20000, 25000, 38000]
-num_tests = 50
-models = ["base", "mem"]
+n_values = [5000, 6000, 7000]
+num_tests = 50 #50
+# models = ["base", "mem"]
+models = ["mem"]
 accuracies = {x: [] for x in models}
 individual_results = {x: [] for x in models}
+n_tokens = {x: [] for x in models}
 
 for n in n_values:
     
@@ -146,26 +152,42 @@ for n in n_values:
         prompt_text, pass_key = generate_prompt(n)
         
         
-        
-        for model_name in models:
-            if pipes[model_name] is None:
-                continue
-            num_tokens = len(pipes[model_name].tokenizer.encode(prompt_text))
+        try:
+            for model_name in models:
+                if pipes[model_name] is None:
+                    continue
+                num_tokens = len(pipes[model_name].tokenizer.encode(prompt_text))
 
-            print("Number of tokens in this prompt: ", num_tokens)
-            model_output = test_model(prompt_text, pass_key, model_name)
-            print(f"Expected number in the prompt: {pass_key}, {model_name} output: {model_output}")
+                print("Number of tokens in this prompt: ", num_tokens)
+                n_tokens[model_name].append(num_tokens)
+                model_output = test_model(prompt_text, pass_key, model_name)
+                print(f"Expected number in the prompt: {pass_key}, {model_name} output: {model_output}")
 
-            if pass_key == model_output:
-                correct_count[model_name] += 1
-                n_results[model_name].append(1)
-                print("Success!")
-            else:
-                n_results[model_name].append(0)
-                print("Fail.")
+                if pass_key == model_output:
+                    correct_count[model_name] += 1
+                    n_results[model_name].append(1)
+                    print("Success!")
+                else:
+                    n_results[model_name].append(0)
+                    print("Fail.")
+        except Exception as e:
+            logging.warning('Exception!', exc_info=e)
+            break
     
     for model in models:
         accuracy = (correct_count[model] / num_tests) * 100
         print(f"Accuracy {model} for n = {n}: {accuracy}%")
         accuracies[model].append(accuracy)
         individual_results[model].append(n_results)
+
+
+with open('individual_results.json', 'w') as f:
+    json.dump(individual_results, f, indent=2)
+
+
+with open('accuracies.json', 'w') as f:
+    json.dump(accuracies, f, indent=2)
+
+
+with open('n_tokens.json', 'w') as f:
+    json.dump(n_tokens, f, indent=2)

@@ -96,7 +96,8 @@ class LlamaRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
-        self.register_buffer("inv_freq", inv_freq)
+        # not persistent in the huggingface implementation, but need to keep it =True for checksum compatibility 
+        self.register_buffer("inv_freq", inv_freq, persistent=True)
 
         # Build here to make `torch.jit.trace` work.
         self.max_seq_len_cached = max_position_embeddings
@@ -277,10 +278,11 @@ class LlamaAttention(nn.Module):
         use_cache: bool = False,
         is_mem: Optional[torch.Tensor] = None,
         last_section_mask: Optional[torch.Tensor] = None,
-        offload_cache_to_cpu: bool = False,
-        use_flash: bool = False,
+        offload_cache_to_cpu: bool = True,
+        use_flash: bool = True,
         cache_top_k: Optional[int] = None,
-        mem_freq: Optional[int] = None
+        mem_freq: Optional[int] = None,
+        aggregate: Optional[str] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -305,7 +307,7 @@ class LlamaAttention(nn.Module):
                 cache_len = past_key_value[0].shape[2]
                 if is_mem is not None:
                     if use_flash:
-                        is_mem = torch.cat((is_mem.new_zeros((1, cache_len)), is_mem), dim=-1)
+                        is_mem = torch.cat((is_mem.new_zeros((bsz, cache_len)), is_mem), dim=-1)
                     else:
                         is_mem = torch.cat((is_mem.new_zeros((1, 1, q_len, cache_len)), is_mem), dim=-1)
                         last_section_mask = torch.cat((last_section_mask.new_ones((1, 1, q_len, cache_len)), last_section_mask), dim=-1)
@@ -329,10 +331,13 @@ class LlamaAttention(nn.Module):
                 if incomplete_len > 0:
                     assert q_len + incomplete_len <= (mem_freq + 1)
                 if use_flash:
-                    is_mem = torch.cat((is_mem.new_zeros((1, incomplete_len)), is_mem), dim=-1)
+                    # is_mem = torch.cat((is_mem.new_zeros((1, incomplete_len)), is_mem), dim=-1)
+                    is_mem = torch.cat((is_mem.new_zeros((bsz, incomplete_len)), is_mem), dim=-1)
                 else:
-                    is_mem = torch.cat((is_mem.new_zeros((1, 1, q_len, incomplete_len)), is_mem), dim=-1)
-                    last_section_mask = torch.cat((last_section_mask.new_ones((1, 1, q_len, incomplete_len)), last_section_mask), dim=-1)
+                    # is_mem = torch.cat((is_mem.new_zeros((1, 1, q_len, incomplete_len)), is_mem), dim=-1)
+                    is_mem = torch.cat((is_mem.new_zeros((bsz, 1, q_len, incomplete_len)), is_mem), dim=-1)
+                    # last_section_mask = torch.cat((last_section_mask.new_ones((1, 1, q_len, incomplete_len)), last_section_mask), dim=-1)
+                    last_section_mask = torch.cat((last_section_mask.new_ones((bsz, 1, q_len, incomplete_len)), last_section_mask), dim=-1)
 
                 if len(past_key_value) > 2:
                     full_len += past_key_value[3].shape[2] * past_key_value[3].shape[3]
@@ -366,10 +371,6 @@ class LlamaAttention(nn.Module):
                 _, mem_key = apply_rotary_pos_emb(None, mem_key_nopos, cos, sin, mem_pos)
                 mem_attn_weights = torch.matmul(query_states, mem_key.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-                if offload_cache_to_cpu:
-                    aggregate = "max_over_tokens"
-                else:
-                    aggregate = None
                 if aggregate == "max_over_tokens":
                     token_retrievers = 1
                     head_retrievers = self.num_heads
@@ -412,12 +413,16 @@ class LlamaAttention(nn.Module):
                     attn_prefix = torch.matmul(query_states.unsqueeze(3), selected_keys.transpose(3, 4)).squeeze(3) / math.sqrt(self.head_dim)
                     expected_att_size = (bsz, self.num_heads, q_len, q_len + incomplete_len)
                 
-                is_mem_prefix = torch.cat((is_mem.new_zeros((mem_freq, )), is_mem.new_ones((1, )))).unsqueeze(0).repeat((top_k, 1))
+                # is_mem_prefix = torch.cat((is_mem.new_zeros((mem_freq, )), is_mem.new_ones((1, )))).unsqueeze(0).repeat((top_k, 1))
+                is_mem_prefix = torch.cat((is_mem.new_zeros((mem_freq, )), is_mem.new_ones((1, )))).unsqueeze(0).repeat((bsz, top_k, 1))
                 if use_flash:
-                    is_mem_prefix = is_mem_prefix.view(1, -1)
+                    # is_mem_prefix = is_mem_prefix.view(1, -1)
+                    is_mem_prefix = is_mem_prefix.view(bsz, -1)
                 else:
-                    is_mem_prefix = is_mem_prefix.view(1, 1, 1, -1).expand(1, 1, q_len, -1)
-                    last_section_mask = torch.cat((last_section_mask.new_zeros((1, 1, q_len, top_k * (mem_freq + 1))), last_section_mask), dim=-1)
+                    # is_mem_prefix = is_mem_prefix.view(1, 1, 1, -1).expand(1, 1, q_len, -1)
+                    is_mem_prefix = is_mem_prefix.view(bsz, 1, 1, -1).expand(bsz, 1, q_len, -1)
+                    # last_section_mask = torch.cat((last_section_mask.new_zeros((1, 1, q_len, top_k * (mem_freq + 1))), last_section_mask), dim=-1)
+                    last_section_mask = torch.cat((last_section_mask.new_zeros((bsz, 1, q_len, top_k * (mem_freq + 1))), last_section_mask), dim=-1)
                 is_mem = torch.cat((is_mem_prefix, is_mem), dim=-1)
 
 
@@ -514,7 +519,8 @@ class LlamaDecoderLayer(nn.Module):
         offload_cache_to_cpu: bool = False,
         use_flash: bool = False,
         cache_top_k: Optional[int] = None,
-        mem_freq: Optional[int] = None
+        mem_freq: Optional[int] = None,
+        aggregate: Optional[str] = None
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -547,7 +553,8 @@ class LlamaDecoderLayer(nn.Module):
             offload_cache_to_cpu=offload_cache_to_cpu,
             use_flash=use_flash,
             cache_top_k=cache_top_k,
-            mem_freq=mem_freq
+            mem_freq=mem_freq,
+            aggregate=aggregate
         )
         hidden_states = residual + hidden_states
 
@@ -746,7 +753,8 @@ class LlamaModel(LlamaPreTrainedModel):
         offload_cache_to_cpu: Optional[bool] = None,
         use_flash: Optional[bool] = None,
         cache_top_k: Optional[int] = None,
-        mem_freq: Optional[int] = None
+        mem_freq: Optional[int] = None,
+        aggregate: Optional[str] = None
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -771,6 +779,11 @@ class LlamaModel(LlamaPreTrainedModel):
                 raise NotImplementedError
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+        
+        if aggregate is None and offload_cache_to_cpu:
+            # aggregate over tokens by default to reduce the number of memory transfer
+            aggregate = "max_over_tokens"
+            logging.warning_once(f'Setting aggregate to {aggregate}! Change offload_cache_to_cpu to False or set aggregate manually to avoid this')
 
         seq_length_with_past = seq_length
         past_key_values_length = 0
@@ -855,7 +868,8 @@ class LlamaModel(LlamaPreTrainedModel):
                     offload_cache_to_cpu,
                     use_flash,
                     cache_top_k,
-                    mem_freq
+                    mem_freq,
+                    aggregate
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -871,6 +885,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_flash=use_flash,
                     cache_top_k=cache_top_k,
                     mem_freq=mem_freq,
+                    aggregate=aggregate
                 )
 
             hidden_states = layer_outputs[0]
@@ -948,6 +963,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         cache_top_k: Optional[int] = None,
         max_chunk_length: Optional[int] = 0,
         mem_freq: Optional[int] = None,
+        aggregate: Optional[str] = None,
         drop_last_logit_if_mem: Optional[bool] = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -975,7 +991,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
         ```"""
-
         use_flash = use_flash if use_flash is not None else self.always_use_flash
 
         if self.auto_insert_landmarks:
@@ -1030,6 +1045,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 use_flash=(use_flash or self.auto_insert_landmarks),
                 cache_top_k=cache_top_k,
                 mem_freq=mem_freq,
+                aggregate=aggregate
             )
             past_key_values = outputs[1]
             if last_logits is not None:
@@ -1160,6 +1176,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 "cache_top_k": kwargs.get("cache_top_k"),
                 "max_chunk_length": kwargs.get("max_chunk_length", 0),
                 "mem_freq": mem_freq,
+                "aggregate": kwargs.get("aggregate"),
                 "drop_last_logit_if_mem": not self.config.include_landmark_in_loss,
             }
         )

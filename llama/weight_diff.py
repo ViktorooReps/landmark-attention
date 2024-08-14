@@ -101,7 +101,7 @@ def recover(
         - If you want to save the recovered weights, set `--path_tuned <your_path_tuned>`.
             Next time you can load the recovered weights directly from `<your_path_tuned>`.
     """
-    model_raw: transformers.PreTrainedModel = transformers.AutoModelForCausalLM.from_pretrained(
+    model_raw: transformers.PreTrainedModel = transformers.LlamaForCausalLM.from_pretrained(
         path_raw,
         device_map={"": torch.device(device)},
         torch_dtype=torch.float32,
@@ -128,8 +128,22 @@ def recover(
 
     state_dict_recovered = model_recovered.state_dict()
     state_dict_raw = model_raw.state_dict()
+
+    state_dict_recovered_names = set(state_dict_recovered.keys())
+    state_dict_raw_names = set(state_dict_raw.keys())
+
+    names_diff = '\n'.join(state_dict_raw_names.difference(state_dict_recovered_names))
+    if len(names_diff):
+        print('in raw but not in recovered:')
+        print(names_diff)
+
+    names_diff = '\n'.join(state_dict_recovered_names.difference(state_dict_raw_names))
+    if len(names_diff):
+        print('in recovered but not in raw:')
+        print(names_diff)
+
     for key in tqdm.tqdm(state_dict_recovered):
-        state_dict_recovered[key].add_(state_dict_raw[key])
+        state_dict_recovered[key].add_(state_dict_raw.get(key, 0))
 
     if check_integrity_naively:
         # This is not a rigorous, cryptographically strong integrity check :)
@@ -139,6 +153,8 @@ def recover(
                 expected_sum = float(f.read())
         else:
             expected_sum = 49798.7656 # backward compatibility with the first released weights
+
+        print(f'Actual sum: {allsum}, Expected sum: {expected_sum}')
         assert torch.allclose(
             allsum, torch.full_like(allsum, fill_value=expected_sum), atol=1e-2, rtol=0
         ), "Naive integrity check failed. This could imply that some of the checkpoint files are corrupted."
